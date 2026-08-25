@@ -1,0 +1,10 @@
+# NEVER commit credentials. Keys live in ~/.config/media/keys.json (0600), not here.
+keys.json
+*.key
+.env
+# per-library configs contain API keys and absolute paths
+scripts/*.json
+!scripts/bpp-floors.json
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,462 @@
+#!/usr/bin/env node
+'use strict';
+// Unified `media` CLI — a THIN wrapper around the existing pipeline scripts.
+// It resolves names→imdb, shells out to download-fast.js / verify-integrity.js /
+// detect-corruption.js, and uses lib-manifest.js for checksum work. It adds NO
+// download/normalize logic of its own, so it can never slow down or interfere
+// with the real scripts — if you don't run `media`, nothing about the pipeline
+// changes.
+//
+//   media download <name|imdb> [seasons] [--dest DIR]
+//   media verify   [path]
+//   media checksum [path]
+//   media fix-corrupt [--yes]
+//   media status
+//   media help
+//
+// `seasons` accepts: "3", "3-5", or "3 5".
+
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const manifest = require('./lib-manifest');
+
+const SCRIPTS = __dirname;
+const CINEMETA = 'https://v3-cinemeta.strem.io';
+const SSH_HOST = process.env.SSH_HOST || 'milan';
+const TUNNEL_PORT = parseInt(process.env.TUNNEL_PORT || '7001', 10);
+const DEFAULT_ROOT = manifest.roots()[0];
+
+const C = {
+  dim: s => `\x1b[2m${s}\x1b[0m`,
+  bold: s => `\x1b[1m${s}\x1b[0m`,
+  red: s => `\x1b[31m${s}\x1b[0m`,
+  green: s => `\x1b[32m${s}\x1b[0m`,
+  yellow: s => `\x1b[33m${s}\x1b[0m`,
+};
+const die = (msg, code = 1) => { console.error(C.red('error: ') + msg); process.exit(code); };
+const sanitize = s => String(s || '').replace(/[\/\\:*?"<>|]/g, '_').trim();
+
+// ---- preflight -----------------------------------------------------------
+
+function mountedRoots() {
+  return manifest.roots().filter(r => { try { return fs.statSync(r).isDirectory(); } catch { return false; } });
+}
+function requireSomeDrive() {
+  const m = mountedRoots();
+  if (!m.length) die(`no drives mounted (looked for ${manifest.roots().join(', ')}). Plug in / mount and retry.`);
+  return m;
+}
+function milanReachable() {
+  const r = spawnSync('nc', ['-z', '-G', '3', SSH_HOST.includes('.') ? SSH_HOST : 'localhost', String(TUNNEL_PORT)],
+    { timeout: 5000 });
+  // Tunnel already up locally?  Otherwise probe ssh host liveness (best-effort).
+  if (r.status === 0) return true;
+  const s = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', SSH_HOST, 'true'], { timeout: 8000 });
+  return s.status === 0;
+}
+
+// ---- name -> imdb --------------------------------------------------------
+
+async function fetchJson(url, ms = 15000) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(ms) });
+  if (!r.ok) throw new Error(`${r.status} ${url}`);
+  return r.json();
+}
+async function resolveImdb(query) {
+  if (/^tt\d+$/i.test(query)) return { id: query, name: query, type: null };
+  for (const type of ['series', 'movie']) {
+    try {
+      const j = await fetchJson(`${CINEMETA}/catalog/${type}/top/search=${encodeURIComponent(query)}.json`);
+      const metas = (j && j.metas) || [];
+      if (metas.length) return { id: metas[0].id, name: metas[0].name, type, alternatives: metas.slice(0, 5) };
+    } catch {}
+  }
+  return null;
+}
+
+// ---- subcommands ---------------------------------------------------------
+
+async function cmdDownload(args) {
+  const rest = [];
+  let dest = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--dest') { dest = args[++i]; continue; }
+    rest.push(args[i]);
+  }
+  if (!rest.length) die('usage: media download <name|imdb> [seasons] [--dest DIR]');
+  const query = rest[0];
+  // seasons: "3", "3-5", or "3 5"
+  let seasonStart, seasonEnd;
+  const seasonTokens = rest.slice(1).join(' ').replace(/-/g, ' ').split(/\s+/).filter(Boolean);
+  if (seasonTokens.length === 1) { seasonStart = seasonEnd = seasonTokens[0]; }
+  else if (seasonTokens.length >= 2) { seasonStart = seasonTokens[0]; seasonEnd = seasonTokens[1]; }
+
+  requireSomeDrive();
+  console.log(C.dim(`resolving "${query}"…`));
+  const res = await resolveImdb(query);
+  if (!res) die(`could not resolve "${query}" to an imdb id (cinemeta search returned nothing). Pass a ttXXXXXXX id directly.`);
+  console.log(`${C.green('resolved')} ${C.bold(res.id)} ${res.name ? C.dim('('+res.name+(res.type?', '+res.type:'')+')') : ''}`);
+  if (res.alternatives && res.alternatives.length > 1) {
+    console.log(C.dim('  other matches: ' + res.alternatives.slice(1).map(a => `${a.id} ${a.name}`).join(' | ')));
+  }
+
+  if (!dest) {
+    const folder = sanitize(res.name || res.id);
+    dest = path.join(DEFAULT_ROOT, folder);
+    console.log(C.yellow(`no --dest given → defaulting to ${dest}`));
+  }
+  // milan is only needed for the torrent fallback; debrid streams straight from
+  // the CDN. So a dead host is a warning, not a blocker.
+  if (!milanReachable()) {
+    console.log(C.yellow(`[warn] ${SSH_HOST} unreachable — debrid downloads still work, torrent fallback disabled.`));
+  }
+
+  const argv = [path.join(SCRIPTS, 'download-fast.js'), res.id, dest];
+  if (seasonStart) argv.push(String(seasonStart), String(seasonEnd));
+  console.log(C.dim(`→ node download-fast.js ${res.id} ${dest} ${seasonStart ? seasonStart + ' ' + seasonEnd : ''}`));
+  const r = spawnSync('node', argv, { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+async function cmdChecksum(args) {
+  const target = args[0] || null;
+  const roots = target ? [target] : requireSomeDrive();
+  for (const t of roots) {
+    if (!fs.existsSync(t)) { console.log(C.yellow(`[skip] ${t} — not present`)); continue; }
+    console.log(C.bold(`checksum: ${t}`));
+    const res = await manifest.buildManifest(t, (done, total, file) => {
+      process.stdout.write(`\r  [${done}/${total}] ${path.basename(file).slice(0, 60)}                `);
+    });
+    process.stdout.write('\n');
+    console.log(`  ${C.green('recorded')} ${res.recorded}/${res.total} into ${res.roots.map(r => path.join(r, manifest.MANIFEST_NAME)).join(', ') || '(none — outside managed roots)'}`);
+  }
+}
+
+const VIDEO_RX = /\.(mkv|mp4|m4v|avi|mov)$/i;
+function walkVideos(root, out = []) {
+  let ents; try { ents = fs.readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const e of ents) {
+    if (e.name.startsWith('.')) continue;
+    const p = path.join(root, e.name);
+    if (e.isDirectory()) walkVideos(p, out);
+    else if (VIDEO_RX.test(e.name)) out.push(p);
+  }
+  return out;
+}
+// HDR transfer functions — these do NOT display right in VLC on macOS; flag them.
+const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67', 'bt2020-10', 'bt2020-12']);
+function colorTransfer(f) {
+  // NOTE: `-of csv=p=0` appends a trailing comma for a single field (e.g.
+  // "smpte2084,"), which broke HDR matching — use the default nokey format.
+  const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=color_transfer',
+    '-of', 'default=noprint_wrappers=1:nokey=1', f], { encoding: 'utf8' });
+  return (r.stdout || '').trim().replace(/,+$/, '');
+}
+function hdrCheck(target) {
+  console.log(C.bold('\n=== color / HDR check ==='));
+  let vids = [];
+  if (target) {
+    try { if (fs.statSync(target).isFile()) vids = [target]; else walkVideos(target, vids); } catch {}
+  } else {
+    for (const r of mountedRoots()) walkVideos(r, vids);
+  }
+  const hdr = vids.map(f => [f, colorTransfer(f)]).filter(([, t]) => HDR_TRANSFERS.has(t));
+  if (!hdr.length) {
+    console.log(`  ${C.green('all ' + vids.length + ' SDR')} — nothing to tone-map`);
+    return;
+  }
+  console.log(C.yellow(`  ${hdr.length} of ${vids.length} file(s) are HDR — won't display right in VLC`));
+  console.log(C.dim('  fix: media tonemap <path>   (converts HDR → SDR, full-res GPU)'));
+  for (const [f, t] of hdr) console.log('    ' + C.yellow('⚠ ' + t) + '  ' + (f.split('/Shows/').pop() || f));
+}
+
+async function cmdVerify(args) {
+  const target = args.find(a => !a.startsWith('--')) || null;
+  requireSomeDrive();
+
+  // (1) checksum-manifest bit-rot check (the reliable single-drive detector)
+  console.log(C.bold('=== checksum manifest (bit-rot) ==='));
+  const v = await manifest.verifyManifest(target, { refresh: false });
+  console.log(`  checked ${v.checked} recorded files: ${C.green(v.ok + ' ok')}, ` +
+    `${(v.bitrot.length ? C.red : C.dim)(v.bitrot.length + ' bit-rot')}, ` +
+    `${v.resized.length} resized, ${v.missing.length} missing, ${v.unrecorded.length} unrecorded`);
+  if (v.bitrot.length) {
+    console.log(C.red('  BIT-ROT (same size, changed bytes — silent corruption):'));
+    for (const b of v.bitrot) console.log('    ✗', b.file);
+  }
+  if (v.unrecorded.length) {
+    console.log(C.dim(`  ${v.unrecorded.length} media files not yet in a manifest — run: media checksum`));
+  }
+
+  // (2) ffmpeg decode + iPad-safe normalize sweep (existing tool, unchanged)
+  console.log(C.bold('\n=== decode / iPad-safe sweep (verify-integrity.js) ==='));
+  const r = spawnSync('node', [path.join(SCRIPTS, 'verify-integrity.js')], { stdio: 'inherit' });
+
+  // (3) macroblock detector, if the other agent's script is present
+  const detector = path.join(SCRIPTS, 'detect-corruption.js');
+  if (fs.existsSync(detector)) {
+    console.log(C.bold('\n=== macroblock detector (detect-corruption.js) ==='));
+    spawnSync('node', [detector, ...(target ? [target] : [])], { stdio: 'inherit' });
+  } else {
+    console.log(C.dim('\n(detect-corruption.js not present yet — skipping macroblock scan)'));
+  }
+
+  // (4) color / HDR check — flag anything not SDR (plays dark in VLC on macOS)
+  hdrCheck(target);
+
+  process.exit(r.status || 0);
+}
+
+// Gather corrupt files from every available signal, then re-download. Destructive
+// (delete+redownload) ONLY with --yes; otherwise dry-run lists what it would do.
+async function cmdFixCorrupt(args) {
+  const doIt = args.includes('--yes');
+  requireSomeDrive();
+  const flagged = new Set();
+
+  // bit-rot from the manifest
+  const v = await manifest.verifyManifest(null, { refresh: false });
+  for (const b of v.bitrot) flagged.add(b.file);
+
+  // broken files from the last integrity report
+  try {
+    const rep = JSON.parse(fs.readFileSync(path.join(SCRIPTS, 'integrity-report.json'), 'utf8'));
+    for (const f of (rep.files || [])) if (f && f.file && f.ok === false) flagged.add(f.file);
+  } catch {}
+
+  // macroblock corruption from the detector's report, if it writes one
+  for (const name of ['corruption-report.json', 'detect-corruption-report.json']) {
+    try {
+      const rep = JSON.parse(fs.readFileSync(path.join(SCRIPTS, name), 'utf8'));
+      const list = rep.corrupt || rep.files || [];
+      for (const f of list) { const fp = typeof f === 'string' ? f : f.file; if (fp) flagged.add(fp); }
+    } catch {}
+  }
+
+  const files = [...flagged].filter(f => { try { return fs.statSync(f).isFile(); } catch { return false; } });
+  if (!files.length) { console.log(C.green('no corrupt files flagged (manifest + integrity-report + detector).')); return; }
+
+  console.log(C.bold(`${files.length} file(s) flagged corrupt:`));
+  for (const f of files) console.log('  ✗', f);
+
+  if (!doIt) {
+    console.log(C.yellow('\ndry-run. Re-download by deleting these and running download-fast per show.'));
+    console.log(C.dim('  media fix-corrupt --yes   # actually delete + re-download (uses verify-integrity.js --fix)'));
+    return;
+  }
+  // Delegate the delete+redownload to verify-integrity.js --fix (it already infers
+  // imdb from vault-meta.json and season ranges from filenames). We don't
+  // reimplement that here.
+  console.log(C.bold('\nrunning verify-integrity.js --fix …'));
+  const r = spawnSync('node', [path.join(SCRIPTS, 'verify-integrity.js'), '--fix'], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+function cmdStatus() {
+  const roots = manifest.roots();
+  console.log(C.bold('drives:'));
+  for (const r of roots) {
+    let mounted = false; try { mounted = fs.statSync(r).isDirectory(); } catch {}
+    if (!mounted) { console.log(`  ${C.red('✗')} ${r} ${C.dim('(not mounted)')}`); continue; }
+    const df = spawnSync('df', ['-h', r], { encoding: 'utf8' });
+    const line = (df.stdout || '').trim().split('\n').pop() || '';
+    const cols = line.split(/\s+/);
+    const size = cols[1], used = cols[2], avail = cols[3], pct = cols[4];
+    const media = manifest.walkMedia(r).length;
+    const parts = countParts(r);
+    console.log(`  ${C.green('✓')} ${r}  ${C.dim(`${used}/${size} used (${pct}), ${avail} free`)}  ${media} media${parts ? C.yellow(', ' + parts + ' in-progress (.part)') : ''}`);
+  }
+  // running download jobs
+  const pg = spawnSync('pgrep', ['-fl', 'download-fast.js'], { encoding: 'utf8' });
+  const jobs = (pg.stdout || '').trim().split('\n').filter(Boolean);
+  console.log(C.bold('\ndownloads in progress:'));
+  if (jobs.length) for (const j of jobs) console.log('  ▸', j.replace(/^\d+\s+/, C.dim('$&')));
+  else console.log(C.dim('  none running'));
+  // milan
+  console.log(C.bold('\nserver:'));
+  console.log(`  ${SSH_HOST}: ${milanReachable() ? C.green('reachable') : C.yellow('unreachable (debrid still works)')}`);
+}
+function countParts(dir, n = 0) {
+  let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return n; }
+  for (const e of entries) {
+    if (e.isDirectory() && !e.name.startsWith('.')) n = countParts(path.join(dir, e.name), n);
+    else if (e.name.endsWith('.part')) n++;
+  }
+  return n;
+}
+
+// Fast, TARGETED macroblock corruption scan. Unlike `verify`, this runs ONLY
+// the frame detector (no manifest check, no full-drive decode sweep), and it
+// accepts ONE OR MANY files/dirs — scan a single episode, a season folder, a
+// show, or a handful at once. --zmin overrides the detector threshold.
+function cmdScan(args) {
+  const detector = path.join(SCRIPTS, 'detect-corruption.js');
+  if (!fs.existsSync(detector)) die('detect-corruption.js not present', 2);
+  const zi = args.indexOf('--zmin');
+  const zmin = zi >= 0 ? args[zi + 1] : null;
+  const paths = args.filter((a, i) => !a.startsWith('--') && !(zi >= 0 && i === zi + 1));
+  if (!paths.length) die('usage: media scan <file-or-dir> [more...] [--zmin N]', 2);
+  const extra = zmin ? ['--zmin', zmin] : [];
+  let worst = 0;
+  for (const p of paths) {
+    if (paths.length > 1) console.log(C.bold(`\n=== ${p} ===`));
+    const r = spawnSync('node', [detector, p, ...extra], { stdio: 'inherit' });
+    if (r.status) worst = r.status;
+  }
+  process.exit(worst);
+}
+
+// Re-add English subtitles to files that had them stripped. Default = Route A
+// (fetch external subs + mux, no video re-download); --repull = Route B (re-fetch
+// the Premiumize source and harvest its embedded subs — perfectly synced, heavier).
+function cmdAddSubs(args) {
+  const script = path.join(SCRIPTS, 'add-subs.py');
+  if (!fs.existsSync(script)) die('add-subs.py not present', 2);
+  if (!args.some(a => !a.startsWith('--') && !['--imdb', '--lang'].includes(args[args.indexOf(a) - 1])))
+    die('usage: media add-subs <file-or-dir> [more...] [--repull] [--imdb ttNN] [--force]', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+// Convert HDR video(s) to SDR so they display correctly in VLC (which mishandles
+// HDR on macOS). Full-resolution Metal GPU tone-map (~3x realtime). Skips SDR files.
+function cmdTonemap(args) {
+  const script = path.join(SCRIPTS, 'tonemap-sdr.sh');
+  if (!fs.existsSync(script)) die('tonemap-sdr.sh not present', 2);
+  if (!args.some(a => !a.startsWith('--')))
+    die('usage: media tonemap <file-or-dir> [more...]   (HDR -> SDR, full res, GPU)', 2);
+  const r = spawnSync('bash', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+// Flag episodes that are visibly SOFTER/blurrier than the rest of the set. The
+// other checks (decode, macroblock, bit-rot) all pass on a file that is simply a
+// bad-quality encode — Naruto S01E26 looked fine to every tool and wrong to the eye.
+function cmdQuality(args) {
+  const script = path.join(SCRIPTS, 'quality-scan.py');
+  if (!fs.existsSync(script)) die('quality-scan.py not present', 2);
+  if (!args.some(a => !a.startsWith('--')))
+    die('usage: media quality <dir> [--samples N] [--workers N]', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+// Natural-language front end. The model never receives a credential — it is told only
+// WHETHER a provider is configured, and this runner substitutes keys at execution time.
+// It emits a validated action against a command whitelist, never a shell string.
+function cmdAi(args) {
+  const script = path.join(SCRIPTS, 'ai.py');
+  if (!fs.existsSync(script)) die('ai.py not present', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+// Credentials live in ~/.config/media/keys.json (0600), never in the repo.
+function cmdKeys(args) {
+  const script = path.join(SCRIPTS, 'keystore.py');
+  if (!fs.existsSync(script)) die('keystore.py not present', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+// Bits-per-pixel scan. `media quality` measures SOFTNESS and is blind to the opposite
+// failure — a bitrate-starved encode that macroblocks on motion scores as marginally
+// SHARPER than a clean one, because block edges are hard edges (Dragon Ball, 2026-08-22).
+// Thresholds are per-resolution-tier and calibrated from this library; a flat figure is
+// useless, since good 1080p sits BELOW bad SD on this metric.
+function cmdBitrate(args) {
+  const script = path.join(SCRIPTS, 'bitrate.py');
+  if (!fs.existsSync(script)) die('bitrate.py not present', 2);
+  if (!args.some(a => !a.startsWith('--')))
+    die('usage: media bitrate <dir|file> [...] [--calibrate]', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+// Multi-source fetch: asks every known finder addon for torrent hashes, then lets
+// PREMIUMIZE decide — anything already cached downloads instantly at full speed.
+// Replaces the torrentio-only path, which stopped everything dead when torrentio
+// went down (Cloudflare 522) on 2026-08-05.
+function cmdFetch(args) {
+  const script = path.join(SCRIPTS, 'fetch.py');
+  if (!fs.existsSync(script)) die('fetch.py not present', 2);
+  if (!args.some(a => !a.startsWith('--')))
+    die('usage: media fetch <imdb> [--movie --name NAME | --season N --eps 25-27] --dest DIR [--res 1080p]', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+function cmdGetBook(args) {
+
+  const script = path.join(SCRIPTS, 'get-book.py');
+  if (!fs.existsSync(script)) die('get-book.py not present', 2);
+  if (!args.some(a => !a.startsWith('--'))) die('usage: media get-book "<title>" [--pdf] [--dest DIR]', 2);
+  const r = spawnSync('python3', [script, ...args], { stdio: 'inherit' });
+  process.exit(r.status || 0);
+}
+
+function help() {
+  console.log(`${C.bold('media')} — thin CLI over the download/verify pipeline
+
+${C.bold('USAGE')}
+  media download <name|imdb> [seasons] [--dest DIR]   download a show/movie (iPad-safe)
+  media add-subs <path...> [--repull] [--imdb ttNN]   re-add English subs (Route A: fetch+mux; --repull: re-pull source subs)
+  media fix-subs <path...>                            de-roll rolling/stacked subs already in file(s) + set auto-on
+  media tonemap  <path...>                            HDR -> SDR. RARELY NEEDED — Infuse/IINA tone-map correctly.
+  media ai       ["what you want"] [--provider ollama|nvidia] [--dry-run]   plain-English front end
+  media keys     [list|set <name>|rm <name>]          store API keys (0600, never in the repo)
+  media fetch    <imdb> [--movie|--season N --eps A-B] --dest DIR   download (11 finders -> Premiumize)
+                 [--res 1080p] [--quality best|balanced|small] [--release <infohash>]
+                 [--depth 10|8|any] [--audio lossless|surround|any] [--no-lock]
+  media quality  <dir>                                flag SOFT/blurry episodes only — BLIND to macroblocking
+                 (a blocky frame scores as SHARPER). Use 'media bitrate' for starved encodes.
+  media bitrate  <dir|file> [--quick] [--calibrate]   THE integrity check: whole-file demux + bpp outliers vs own season
+                 [--flagged-only] [--no-trunc]        --quick = 12s tail only. Full sweep ~80min for the library.
+  media get-book "<title>" [--pdf]                    download an ebook from LibGen (EPUB, malware-checked)
+  media checksum [path]                               (re)build the .media-manifest.json hash record
+  media fix-corrupt [--yes]                           re-download files flagged corrupt (dry-run without --yes)
+  media status                                        drive space, media counts, in-progress + server
+  media help
+
+${C.bold('SEASONS')}   "3"  ·  "3-5"  ·  "3 5"   (omit to grab all)
+
+${C.bold('EXAMPLES')}
+  media fetch tt3061046 --season 5 --eps 23-23 --dest "/Volumes/Media/Shows/Steven-Universe" --quality balanced
+  media fetch tt0417299 --season 2 --eps 12-12 --dest "/Volumes/Media/Shows/Avatar" --quality best
+  media bitrate "/Volumes/Media/Shows"
+  media download "steven universe"
+  media download tt0096697 17 18 --dest "/Volumes/Media/Shows/The Simpsons"
+  media scan "/Volumes/Media/Shows/Example/Season 2"
+  media scan "/path/ep1.mkv" "/path/ep2.mkv" --zmin 12
+  media checksum
+  media status
+
+${C.dim('Wraps: download-fast.js, verify-integrity.js, detect-corruption.js, lib-manifest.js.')}
+${C.dim('Env: SSH_HOST, TUNNEL_PORT, MANIFEST_ROOTS, plus download-fast.js knobs (SHRINK, DEBRID_ONLY, …).')}`);
+}
+
+// ---- dispatch ------------------------------------------------------------
+
+(async () => {
+  const [, , cmd, ...args] = process.argv;
+  switch (cmd) {
+    case 'download': case 'dl': return cmdDownload(args);
+    case 'scan': return cmdScan(args);
+    case 'add-subs': case 'subs': return cmdAddSubs(args);
+    case 'fix-subs': return cmdAddSubs([...args, '--fix']);
+    case 'tonemap': case 'sdr': return cmdTonemap(args);
+    case 'fetch': case 'get': return cmdFetch(args);
+    case 'quality': case 'blur': return cmdQuality(args);
+    case 'bitrate': case 'bpp': return cmdBitrate(args);
+    case 'ai': return cmdAi(args);
+    case 'keys': return cmdKeys(args);
+    case 'get-book': case 'book': return cmdGetBook(args);
+    case 'checksum': case 'hash': return cmdChecksum(args);
+    case 'fix-corrupt': case 'fix': return cmdFixCorrupt(args);
+    case 'status': case 'st': return cmdStatus();
+    case 'help': case '--help': case '-h': case undefined: return help();
+    default: die(`unknown command "${cmd}". Run: media help`, 2);
+  }
+})().catch(e => die(e && e.message || String(e)));

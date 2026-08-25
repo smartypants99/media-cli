@@ -1,0 +1,22 @@
+{
+  "_README": "Per-tier bits-per-pixel floors. A tier ABSENT here is NOT enforced (check() returns 'ok') - deliberate: an uncalibrated guess rejects good downloads. Derived 2026-08-25 from a library verified 1294/1294 intact by full demux sweep.",
+  "_METHOD": "reject is set BELOW the minimum of the verified-clean corpus, not at a percentile. A percentile floor rejects your own good files by construction (0.80 x p05 rejected 5 Adventure Time episodes on a library confirmed intact - flat animation compresses better than anything else here). The floor answers 'thinner than ANY good file I own', which is a real signal; 'below the 5th percentile of my own library' is not.",
+  "hd1080": {
+    "reject": 0.0161,
+    "warn": 0.0179,
+    "_n": 1116,
+    "_clean_min": 0.01787005770961934,
+    "_p05": 0.025283786369920264,
+    "_note": "reject = 0.80 Mbps at 1920x1080. Rejects 0 files in the clean library. 1116 samples, many shows and codecs, relative-outliers excluded."
+  },
+  "_sd_DELIBERATELY_UNSET": {
+    "why_not": "156 sd files but 153 are Dragon Ball, an unusually generous release at 0.42 bpp. Calibrating from it demands 2.43 Mbps at 708x480 and would reject good SD (typically 1-1.5 Mbps) including this library's own Adventure Time at 0.066-0.10. n=156 is one SHOW, not one sample set.",
+    "meanwhile": "relative_outliers catches thin SD within a season and needs no calibration."
+  },
+  "_hd720_DELIBERATELY_UNSET": {
+    "why_not": "n=3"
+  },
+  "_uhd_DELIBERATELY_UNSET": {
+    "why_not": "n=10"
+  }
+}

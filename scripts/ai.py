@@ -199,10 +199,43 @@ def pick_model(provider, key, override=None):
     return sorted(avail)[0] if avail else cfg['prefer'][0]
 
 
-def build_context():
-    """Everything the model needs, assembled from the project itself so it stays
-    current: the operating notes, the CLI surface, and which providers exist."""
+def resolve_title(name, kind='series'):
+    """title -> [(imdb_id, name, year)] via cinemeta. Done in code, not by the model.
+
+    Expecting an LLM to recall IMDb ids is asking for hallucinated ids that fail or,
+    worse, silently fetch the wrong show. A lookup is free and exact.
+    """
+    try:
+        q = urllib.parse.quote(name)
+        d = http_json(f'https://v3-cinemeta.strem.io/catalog/{kind}/top/search={q}.json',
+                      timeout=25)
+        out = []
+        for m in (d or {}).get('metas', [])[:5]:
+            if m.get('imdb_id') or m.get('id', '').startswith('tt'):
+                out.append((m.get('imdb_id') or m['id'], m.get('name', ''),
+                            str(m.get('releaseInfo', ''))[:4]))
+        return out
+    except Exception:
+        return []
+
+
+def build_context(small=False):
+    """Assembled from the project itself so it stays current.
+
+    `small` trims hard for models under ~30B: they cannot exploit the full operating
+    notes and the volume crowds out the actual instructions. Observed on an 8B given
+    16k chars: it echoed the instructions back and re-asked for details the user had
+    already given in the same message.
+    """
     parts = []
+    if small:
+        lib = prefs().get('library')
+        cfg = configured()
+        deb = [k for k in ('premiumize', 'alldebrid', 'realdebrid', 'torbox') if cfg.get(k)]
+        return (f'Library root: {lib or "NOT SET"} (put shows in subfolders under it).\n'
+                f'Debrid: {", ".join(deb) if deb else "none — downloads will be slow"}.\n'
+                'Quality tiers: best | balanced | small. Default balanced.\n'
+                'Do not ask where to save things; use the library root.')
     # KNOWLEDGE.md is the whole point: without it the model knows the flags but none of
     # the reasons, and will happily ask for 10-bit on a title where that costs 8x the
     # bitrate, or trust a "1080p" label that is really a 1 GB upscale.
@@ -236,6 +269,22 @@ def build_context():
                  '"media keys set premiumize" and that it makes downloads dramatically faster.'))
     return '\n\n'.join(parts)
 
+
+SYSTEM_SMALL = '''You turn a request into ONE command for a media CLI.
+
+Reply with ONLY JSON. No explanation, no repeating the question.
+
+If you have title + season, run it:
+{"action":"run","cmd":"fetch","args":["The Simpsons","--season","1","--eps","1-30","--dest","<library>/The Simpsons","--quality","balanced"]}
+
+Use the SHOW TITLE as the first arg. Never invent an tt id — the runner looks it up.
+If the user named a folder or drive, use it in --dest exactly as they said.
+
+Only if you genuinely do not know the title or season:
+{"action":"ask","question":"..."}
+
+Never ask for something the user already told you in this conversation.
+'''
 
 SYSTEM = """You help a user drive a media-library CLI. You are given the project's
 operating notes and the CLI surface.
@@ -320,6 +369,48 @@ def parse_action(txt):
         return None
 
 
+# flags that consume exactly one value
+TAKES_VALUE = {'--name', '--season', '--eps', '--dest', '--res', '--quality',
+               '--depth', '--audio', '--release', '--minmin', '--maxmin',
+               '--samples', '--workers'}
+
+
+def fix_paths(args):
+    """Repair a --dest the model split across arguments, and map a drive name the user
+    said to the volume that actually exists.
+
+    Observed: for "into my hard drive TD in the folder kjbkhb" an 8B emitted
+    ["--dest", "/Volumes/TD/", "kjbkhb"] — two arguments. That passes a naive flag check
+    and silently downloads to the wrong directory. It also said TD when the mounted
+    volume is TD-storage.
+    """
+    if '--dest' not in args:
+        return args, None
+    i = args.index('--dest')
+    j = i + 1
+    parts = []
+    while j < len(args) and not args[j].startswith('--'):
+        parts.append(args[j]); j += 1
+    if not parts:
+        return args, 'no value for --dest'
+    dest = parts[0] if len(parts) == 1 else os.path.join(*[parts[0].rstrip('/')] + parts[1:])
+    note = None
+    # map a said-name to a real volume: "TD" -> "TD-storage"
+    if dest.startswith('/Volumes/') and not os.path.isdir(os.path.dirname(dest.rstrip('/')) or '/'):
+        want = dest.split('/')[2] if len(dest.split('/')) > 2 else ''
+        try:
+            vols = [v for v in os.listdir('/Volumes') if not v.startswith('.')]
+        except Exception:
+            vols = []
+        if want and want not in vols:
+            m = [v for v in vols if v.lower().startswith(want.lower())
+                 or want.lower() in v.lower()]
+            if len(m) == 1:
+                dest = dest.replace(f'/Volumes/{want}', f'/Volumes/{m[0]}', 1)
+                note = f'drive {want!r} -> {m[0]!r}'
+    return args[:i] + ['--dest', dest] + args[j:], note
+
+
 def validate(cmd, args):
     if cmd not in ALLOWED:
         return f'command {cmd!r} is not allowed'
@@ -327,6 +418,28 @@ def validate(cmd, args):
     bad = flags - ALLOWED[cmd]
     if bad:
         return f'flags not permitted for {cmd}: {", ".join(sorted(bad))}'
+    # every value-taking flag must have exactly one value, and there must be no stray
+    # positional arguments after the first — a split path lands the download elsewhere
+    i, seen_positional = 0, 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith('--'):
+            if a in TAKES_VALUE:
+                vals = []
+                j = i + 1
+                while j < len(args) and not args[j].startswith('--'):
+                    vals.append(args[j]); j += 1
+                if len(vals) != 1:
+                    return (f'{a} needs exactly one value, got {len(vals)}: {vals}'
+                            if vals else f'{a} is missing its value')
+                i = j
+                continue
+            i += 1
+        else:
+            seen_positional += 1
+            if seen_positional > 1:
+                return f'unexpected extra argument: {a!r}'
+            i += 1
     for a in args:
         if any(c in a for c in ';|&$`\n') or a.startswith('$('):
             return f'refusing suspicious argument: {a!r}'
@@ -352,7 +465,12 @@ def main():
     model = pick_model(provider, key, model_arg)
     print(f'[{provider} · {model}]', flush=True)
 
-    msgs = [{'role': 'system', 'content': SYSTEM + '\n\n' + build_context()}]
+    # crude but effective: 8b/7b/mini class models get the short prompt
+    small = any(k in model.lower() for k in ('8b', '7b', '3b', '4b', 'mini', 'small', 'nano'))
+    sysmsg = (SYSTEM_SMALL if small else SYSTEM) + '\n\n' + build_context(small)
+    msgs = [{'role': 'system', 'content': sysmsg}]
+    if small:
+        print(f'  (small model — using compact prompt, {len(sysmsg):,} chars)')
     print("  (chat normally — say what you want. 'q' to quit)\n")
     try:
         first = ' '.join(argv).strip() or input('> ').strip()
@@ -396,6 +514,29 @@ def main():
             continue
         if act.get('action') == 'run':
             cmd, args = act.get('cmd', ''), [str(a) for a in act.get('args', [])]
+            # The model gives a TITLE; we resolve it. This removes the one thing small
+            # models reliably get wrong — hallucinating an IMDb id that fetches the
+            # wrong show or nothing at all.
+            if cmd == 'fetch' and args and not args[0].startswith('tt'):
+                kind = 'movie' if '--movie' in args else 'series'
+                hits = resolve_title(args[0], kind)
+                if not hits:
+                    msgs += [{'role': 'assistant', 'content': reply},
+                             {'role': 'user', 'content': f'No match for {args[0]!r}. Ask the user.'}]
+                    print(f'  could not find {args[0]!r}'); continue
+                if len(hits) > 1 and hits[0][1].lower() != args[0].strip().lower():
+                    print(f'\n  which one?')
+                    for n, (i_, nm, yr) in enumerate(hits, 1):
+                        print(f'    {n}) {nm} ({yr})  {i_}')
+                    c = input('  choice [1]: ').strip() or '1'
+                    hit = hits[int(c) - 1] if c.isdigit() and 1 <= int(c) <= len(hits) else hits[0]
+                else:
+                    hit = hits[0]
+                print(f'  resolved: {hit[1]} ({hit[2]}) -> {hit[0]}')
+                args[0] = hit[0]
+            args, note = fix_paths(args)
+            if note:
+                print(f'  {note}')
             err = validate(cmd, args)
             if err:
                 msgs += [{'role': 'assistant', 'content': reply},

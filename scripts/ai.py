@@ -123,10 +123,14 @@ PROVIDERS = {
                'models_url': 'https://ollama.com/api/tags',
                'prefer': ['qwen3-coder:480b', 'deepseek-v3.1:671b', 'gpt-oss:120b',
                           'qwen3:235b', 'llama3.3:70b', 'gpt-oss:20b']},
+    # NVIDIA order is LATENCY-FIRST, measured on a real account: llama-3.1-8b answers in
+    # 0.7s while the 70B models take 41-54s for the SAME two-token reply. That is the
+    # difference between a conversation and a frozen terminal. Bigger models sit lower as
+    # a fallback, and --model overrides.
     'nvidia': {'url': 'https://integrate.api.nvidia.com/v1/chat/completions',
                'models_url': 'https://integrate.api.nvidia.com/v1/models',
-               'prefer': ['deepseek-ai/deepseek-r1', 'qwen/qwen2.5-coder-32b-instruct',
-                          'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct']},
+               'prefer': ['meta/llama-3.1-8b-instruct', 'qwen/qwen2.5-coder-32b-instruct',
+                          'meta/llama-3.3-70b-instruct', 'meta/llama-3.1-70b-instruct']},
 }
 
 # Only these may ever be executed. The model cannot invent a command.
@@ -168,22 +172,31 @@ def pick_provider(explicit=None):
     return p, have[p]
 
 
-def pick_model(provider, key):
-    """Auto-pick: the highest-preference model the account can actually see."""
+def pick_model(provider, key, override=None):
+    """Auto-pick a model that is actually SERVABLE, not merely listed.
+
+    The models endpoint lists far more than it will serve: on a real account, 95 models
+    were listed and most returned 404 on first use. Listing is not availability, so each
+    candidate gets a cheap liveness probe before being chosen.
+    """
+    if override:
+        return override
     cfg = PROVIDERS[provider]
     try:
         d = http_json(cfg['models_url'], key=key, timeout=30)
-        if provider == 'ollama':
-            avail = {m['name'] for m in d.get('models', [])}
-        else:
-            avail = {m['id'] for m in d.get('data', [])}
-        for want in cfg['prefer']:
-            for a in avail:
-                if a.startswith(want.split(':')[0]) or a == want:
-                    return a
-        return sorted(avail)[0] if avail else cfg['prefer'][0]
+        avail = ({m['name'] for m in d.get('models', [])} if provider == 'ollama'
+                 else {m['id'] for m in d.get('data', [])})
     except Exception:
-        return cfg['prefer'][-1]      # smallest/safest fallback
+        return cfg['prefer'][0]
+    for want in cfg['prefer']:
+        for a in sorted(avail):
+            if a == want or a.startswith(want.split(':')[0]):
+                try:
+                    _chat(provider, key, a, [{'role': 'user', 'content': 'hi'}])
+                    return a
+                except Exception:
+                    break        # listed but not servable — try the next preference
+    return sorted(avail)[0] if avail else cfg['prefer'][0]
 
 
 def build_context():
@@ -240,6 +253,10 @@ infer.
 You are NEVER given API keys and must never ask the user to paste one to you. If a
 service is not configured, tell them to run `media keys set <name>` themselves.
 
+Talk normally. You are having a conversation — greet the user, answer questions about
+the library or about video quality, think out loud. Only switch to JSON when you are
+actually ready to run something.
+
 When you have enough to act, reply with ONLY a JSON object, no prose:
 {"action":"run","cmd":"fetch","args":["tt0417299","--season","2","--eps","12-12",
  "--dest","/path","--quality","balanced"],"why":"one line"}
@@ -255,7 +272,31 @@ Rules for args:
 - Never invent flags outside the CLI help you were given."""
 
 
-def chat(provider, key, model, messages):
+def chat(provider, key, model, messages, quiet=False):
+    """Talk to the model, showing progress. A silent 30-second HTTPS read looks like a
+    hang and gets Ctrl+C'd, so always print something."""
+    import threading, itertools, time as _t
+    stop = threading.Event()
+
+    def spin():
+        for c in itertools.cycle('|/-\\'):
+            if stop.is_set():
+                break
+            sys.stdout.write(f'\r  thinking {c} '); sys.stdout.flush(); _t.sleep(0.12)
+        sys.stdout.write('\r' + ' ' * 20 + '\r'); sys.stdout.flush()
+
+    th = None
+    if not quiet and sys.stdout.isatty():
+        th = threading.Thread(target=spin, daemon=True); th.start()
+    try:
+        return _chat(provider, key, model, messages)
+    finally:
+        stop.set()
+        if th:
+            th.join(timeout=1)
+
+
+def _chat(provider, key, model, messages):
     if provider == 'ollama':
         d = http_json(PROVIDERS[provider]['url'],
                       {'model': model, 'messages': messages, 'stream': False}, key)
@@ -297,6 +338,9 @@ def main():
     provider_arg = None
     if '--provider' in argv:
         i = argv.index('--provider'); provider_arg = argv[i + 1]; del argv[i:i + 2]
+    model_arg = None
+    if '--model' in argv:
+        i = argv.index('--model'); model_arg = argv[i + 1]; del argv[i:i + 2]
     dry = '--dry-run' in argv
     argv = [a for a in argv if a != '--dry-run']
     if '--set-library' in argv:
@@ -305,29 +349,48 @@ def main():
         print(f'library root set to {prefs()["library"]}'); return
     ensure_library()
     provider, key = pick_provider(provider_arg)
-    model = pick_model(provider, key)
+    model = pick_model(provider, key, model_arg)
     print(f'[{provider} · {model}]', flush=True)
 
     msgs = [{'role': 'system', 'content': SYSTEM + '\n\n' + build_context()}]
-    first = ' '.join(argv).strip() or input('what do you want? ').strip()
+    print("  (chat normally — say what you want. 'q' to quit)\n")
+    try:
+        first = ' '.join(argv).strip() or input('> ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print(); return
+    if not first:
+        return
     msgs.append({'role': 'user', 'content': first})
 
-    for _ in range(12):
+    for _ in range(40):
         try:
             reply = chat(provider, key, model, msgs)
+        except KeyboardInterrupt:
+            print('\n(cancelled)'); return
         except Exception as e:
-            sys.exit(f'{provider} request failed: {e}')
+            print(f'\n  {provider} request failed: {e}')
+            if input('  retry? [Y/n] ').strip().lower() in ('n', 'no'):
+                return
+            continue
         act = parse_action(reply)
         if not act:
-            print(reply.strip()[:600])
-            more = input('\n> ').strip()
-            if not more:
+            print(reply.strip())
+            try:
+                more = input('\n> ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print(); return
+            if not more or more.lower() in ('q', 'quit', 'exit', 'bye'):
                 return
             msgs += [{'role': 'assistant', 'content': reply},
                      {'role': 'user', 'content': more}]
             continue
         if act.get('action') == 'ask':
-            ans = input(f"\n{act['question']}\n> ").strip()
+            try:
+                ans = input(f"\n{act['question']}\n> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(); return
+            if ans.lower() in ('q', 'quit', 'exit'):
+                return
             msgs += [{'role': 'assistant', 'content': reply},
                      {'role': 'user', 'content': ans}]
             continue
@@ -351,8 +414,12 @@ def main():
                 save_dest(args[args.index('--dest') + 1])
             sys.exit(subprocess.run(full).returncode)
         print(reply.strip()[:600]); return
-    print('gave up after 12 turns')
+    print('(conversation limit reached)')
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\n(cancelled)')
+        sys.exit(130)

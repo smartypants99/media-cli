@@ -36,6 +36,7 @@ def _read():
 
 def load_key(name):
     """-> key string or None. Env var wins so CI/one-offs can override the store."""
+    name = (name or '').strip().lower()
     env = KNOWN.get(name, (None,))[0]
     if env and os.environ.get(env):
         return os.environ[env]
@@ -72,7 +73,8 @@ def main():
         print('  media keys rm  <name>')
         return
     if a[0] == 'set' and len(a) > 1:
-        name = a[1]
+        # accept NVIDIA / Nvidia / nvidia — nobody should have to guess the casing
+        name = a[1].strip().lower()
         if name not in KNOWN:
             print(f'unknown key {name!r}. known: {", ".join(KNOWN)}'); sys.exit(2)
         import getpass
@@ -84,7 +86,7 @@ def main():
         print(f'saved to {KEYS_PATH} (0600)')
         return
     if a[0] == 'rm' and len(a) > 1:
-        d = _read(); d.pop(a[1], None)
+        d = _read(); d.pop(a[1].strip().lower(), None)
         os.makedirs(CONFIG_DIR, exist_ok=True)
         fd = os.open(KEYS_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
         with os.fdopen(fd, 'w') as f:

@@ -129,8 +129,13 @@ PROVIDERS = {
     # a fallback, and --model overrides.
     'nvidia': {'url': 'https://integrate.api.nvidia.com/v1/chat/completions',
                'models_url': 'https://integrate.api.nvidia.com/v1/models',
-               'prefer': ['meta/llama-3.1-8b-instruct', 'qwen/qwen2.5-coder-32b-instruct',
-                          'meta/llama-3.3-70b-instruct', 'meta/llama-3.1-70b-instruct']},
+               # MoE first: large total parameters, small active set, so capability at
+               # near-small-model latency. Measured on a real account with the full
+               # 17.8k prompt: gpt-oss-120b 1.7s, minimax-m3 1.7s, llama-3.1-8b 0.8s but
+               # noticeably dimmer, while DENSE 70B models take 41-54s for the same work.
+               'prefer': ['openai/gpt-oss-120b', 'minimaxai/minimax-m3',
+                          'openai/gpt-oss-20b', 'meta/llama-3.1-8b-instruct',
+                          'meta/llama-3.3-70b-instruct']},
 }
 
 # Only these may ever be executed. The model cannot invent a command.
@@ -289,8 +294,17 @@ Never ask for something the user already told you in this conversation.
 SYSTEM = """You help a user drive a media-library CLI. You are given the project's
 operating notes and the CLI surface.
 
-Ask SHORT clarifying questions one at a time until you know: what title, movie or
-series, which seasons/episodes, and the quality tier.
+DO NOT interrogate the user. Ask ONLY for something you genuinely cannot infer, and
+NEVER ask about anything they already told you in this conversation.
+
+Specifically, do NOT ask about:
+- quality tier — default to balanced silently unless they raised it
+- where to save — a library root is configured; build the path under it
+- the IMDb id — the runner resolves the title
+- whether they want the whole season — assume yes unless they said otherwise
+
+A request like "download The Simpsons season 1 into my TD drive, folder kjbkhb"
+contains everything you need. Run it.
 
 DO NOT ask where to save things. A library root is configured for you. Build the --dest
 under it, e.g. <library root>/<Show Name>. Only mention the path in passing ("saving to
@@ -307,14 +321,18 @@ the library or about video quality, think out loud. Only switch to JSON when you
 actually ready to run something.
 
 When you have enough to act, reply with ONLY a JSON object, no prose:
-{"action":"run","cmd":"fetch","args":["tt0417299","--season","2","--eps","12-12",
- "--dest","/path","--quality","balanced"],"why":"one line"}
+{"action":"run","cmd":"fetch","args":["Avatar: The Last Airbender","--season","2",
+ "--eps","12-12","--dest","<library>/Avatar","--quality","balanced"],"why":"one line"}
+
+Each flag takes exactly ONE value. A path with spaces is still one argument:
+"--dest","/Volumes/Drive/My Folder"   NOT   "--dest","/Volumes/Drive/","My Folder"
 
 To ask a question instead reply with ONLY:
 {"action":"ask","question":"..."}
 
 Rules for args:
-- IMDb ids look like tt0417299. If unsure of the id, ask.
+- Pass the SHOW TITLE as the first argument, e.g. "The Simpsons". NEVER supply or
+  invent an IMDb id — the runner looks the title up and confirms ambiguous matches.
 - --quality: best | balanced | small. Default balanced.
 - --depth 10 only if the user asked for 10-bit; warn it can cost picture quality.
 - --audio lossless|surround only if asked.

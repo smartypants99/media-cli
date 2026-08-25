@@ -606,7 +606,22 @@ def main():
         grab(imdb, dest, opt('--name', imdb), res, min_minutes=int(opt('--minmin', '60')))
         return
     season = int(opt('--season', '1'))
-    rng = opt('--eps', '1')
+    rng = opt('--eps')
+    if not rng:
+        # "--season 1" with no --eps means THE WHOLE SEASON, not episode 1. Defaulting to
+        # a single episode silently gave one file when a season was asked for, which looks
+        # like a broken download rather than a misunderstood flag.
+        _m = curl_json(f'https://v3-cinemeta.strem.io/meta/series/{imdb}.json') or {}
+        _eps = [v.get('episode') for v in (_m.get('meta') or {}).get('videos', [])
+                if v.get('season') == season and v.get('episode')]
+        if _eps:
+            rng = f'1-{max(_eps)}'
+            print(f'  no --eps given; taking the whole season: {rng} ({len(_eps)} episodes)',
+                  flush=True)
+        else:
+            rng = '1'
+            print('  no --eps given and episode list unavailable; fetching episode 1 only',
+                  flush=True)
     # Lock the whole season to ONE release. Ranking each episode independently pulled
     # Witch Hat Atelier S1 from four different packs across three codecs — including a
     # VVC file VLC can't decode — with mismatched subtitle layouts (2026-08-11). A

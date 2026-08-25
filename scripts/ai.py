@@ -26,26 +26,94 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from keystore import load_key, configured, KNOWN, CONFIG_DIR
 
 
-def load_dest():
+PREFS = os.path.join(CONFIG_DIR, 'prefs.json')
+
+
+def prefs():
     try:
-        return json.load(open(os.path.join(CONFIG_DIR, 'prefs.json'))).get('dest')
+        return json.load(open(PREFS))
     except Exception:
-        return None
+        return {}
+
+
+def set_pref(k, v):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        d = prefs(); d[k] = v
+        json.dump(d, open(PREFS, 'w'), indent=2)
+    except Exception:
+        pass
+
+
+def load_dest():
+    return prefs().get('dest')
 
 
 def save_dest(d):
-    try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        p = os.path.join(CONFIG_DIR, 'prefs.json')
-        cur = {}
-        try:
-            cur = json.load(open(p))
-        except Exception:
-            pass
-        cur['dest'] = d
-        json.dump(cur, open(p, 'w'), indent=2)
-    except Exception:
-        pass
+    set_pref('dest', d)
+
+
+def candidate_roots():
+    """Writable places a library could plausibly live, largest free space first."""
+    out = []
+    SKIP = ('macintosh hd', 'com.apple.timemachine', 'recovery', 'preboot', 'vm')
+    for base in ('/Volumes',):
+        if not os.path.isdir(base):
+            continue
+        for v in sorted(os.listdir(base)):
+            p_ = os.path.join(base, v)
+            if v.startswith('.') or not os.path.isdir(p_):
+                continue
+            if any(k in v.lower() for k in SKIP) or not os.access(p_, os.W_OK):
+                continue
+            try:
+                st = os.statvfs(p_)
+                free = st.f_bavail * st.f_frsize / 1e9
+            except Exception:
+                continue
+            subs = [d for d in sorted(os.listdir(p_))
+                    if os.path.isdir(os.path.join(p_, d)) and not d.startswith('.')
+                    and d.lower() in ('shows', 'tv', 'movies', 'media', 'series')]
+            for sub in (subs or ['']):
+                out.append((os.path.join(p_, sub).rstrip('/'), free))
+    for h in (os.path.expanduser('~/Movies'), os.path.expanduser('~/Media')):
+        if os.path.isdir(h):
+            try:
+                st = os.statvfs(h)
+                out.append((h, st.f_bavail * st.f_frsize / 1e9))
+            except Exception:
+                pass
+    return sorted(out, key=lambda x: -x[1])
+
+
+def ensure_library():
+    """Ask ONCE for where the library lives, then never again.
+
+    Asking the model to negotiate a destination every run means the user retypes an
+    absolute path from memory each time. This is a plain prompt, not a model turn: it
+    offers what is mounted, takes a number or a path, and saves it.
+    """
+    lib = prefs().get('library')
+    if lib:
+        return lib
+    roots = candidate_roots()
+    print('Where should downloads go? (asked once, saved to '
+          f'{PREFS})\n')
+    for i, (p_, free) in enumerate(roots, 1):
+        print(f'  {i}) {p_}  ({free:.0f} GB free)')
+    print(f'  {len(roots) + 1}) somewhere else — type a full path\n')
+    ans = input('choice: ').strip()
+    if ans.isdigit() and 1 <= int(ans) <= len(roots):
+        lib = roots[int(ans) - 1][0]
+    else:
+        lib = os.path.expanduser(ans if not ans.isdigit() else
+                                 input('full path: ').strip())
+    if not lib:
+        sys.exit('no library path given')
+    os.makedirs(lib, exist_ok=True)
+    set_pref('library', lib)
+    print(f'saved. change it later with:  media ai --set-library <path>\n')
+    return lib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -135,38 +203,14 @@ def build_context():
         parts.append('--- media CLI ---\n' + h)
     except Exception:
         pass
-    # Where things can actually go. Without this the model asks "where should I put it?"
-    # with no idea what exists, and the user has to type an absolute path from memory.
-    dests, last = [], load_dest()
-    for base in ('/Volumes', os.path.expanduser('~/Movies'), os.path.expanduser('~/Media')):
-        if not os.path.isdir(base):
-            continue
-        if base == '/Volumes':
-            # The boot volume and Time Machine snapshots are not download targets; the
-            # first fills your system disk, the second is not writable in any useful way.
-            SKIP = ('macintosh hd', 'com.apple.timemachine', 'recovery', 'preboot', 'vm')
-            for v in sorted(os.listdir(base)):
-                p_ = os.path.join(base, v)
-                if v.startswith('.') or not os.path.isdir(p_):
-                    continue
-                if any(k in v.lower() for k in SKIP) or not os.access(p_, os.W_OK):
-                    continue
-                try:
-                    st = os.statvfs(p_)
-                    free = st.f_bavail * st.f_frsize / 1e9
-                except Exception:
-                    continue
-                subs = [d for d in sorted(os.listdir(p_))[:40]
-                        if os.path.isdir(os.path.join(p_, d)) and not d.startswith('.')
-                        and d.lower() in ('shows', 'tv', 'movies', 'media', 'series')]
-                for sub in (subs or ['']):
-                    d_ = os.path.join(p_, sub).rstrip('/')
-                    dests.append(f"{d_}  ({free:.0f} GB free)")
-        else:
-            dests.append(base)
-    parts.append('--- destinations available on this machine ---\n' +
-                 ('\n'.join(dests) if dests else 'none detected — ask the user for a path') +
-                 (f'\nLAST USED (prefer this unless told otherwise): {last}' if last else ''))
+    # The library root is settled ONCE by ensure_library(), outside the model. The
+    # model is told where it is and builds show folders under it, rather than asking
+    # the user to type an absolute path on every run.
+    lib = prefs().get('library')
+    extra = [f'{p_}  ({free:.0f} GB free)' for p_, free in candidate_roots()]
+    parts.append('--- library root (use this; put shows in subfolders under it) ---\n' +
+                 (lib or 'NOT SET') +
+                 ('\nother writable locations:\n' + '\n'.join(extra) if extra else ''))
 
     cfg = configured()
     parts.append('--- available services (booleans only; you are NOT given keys) ---\n' +
@@ -184,12 +228,12 @@ SYSTEM = """You help a user drive a media-library CLI. You are given the project
 operating notes and the CLI surface.
 
 Ask SHORT clarifying questions one at a time until you know: what title, movie or
-series, which seasons/episodes, the destination folder, and the quality tier.
+series, which seasons/episodes, and the quality tier.
 
-You are given the destinations that exist on this machine with their free space. SUGGEST
-one rather than asking the user to type a path from memory — e.g. "I'll put it in
-/Volumes/Media/Shows (1.2 TB free), or tell me somewhere else." If a LAST USED path is
-given, default to it. Warn if free space looks tight for what was asked. Prefer
+DO NOT ask where to save things. A library root is configured for you. Build the --dest
+under it, e.g. <library root>/<Show Name>. Only mention the path in passing ("saving to
+.../Avatar"), and only ask if the user wants somewhere different. Warn if free space
+looks tight for what was asked. Prefer
 sensible defaults over interrogating the user — only ask what you genuinely cannot
 infer.
 
@@ -255,6 +299,11 @@ def main():
         i = argv.index('--provider'); provider_arg = argv[i + 1]; del argv[i:i + 2]
     dry = '--dry-run' in argv
     argv = [a for a in argv if a != '--dry-run']
+    if '--set-library' in argv:
+        i = argv.index('--set-library')
+        set_pref('library', os.path.expanduser(argv[i + 1]))
+        print(f'library root set to {prefs()["library"]}'); return
+    ensure_library()
     provider, key = pick_provider(provider_arg)
     model = pick_model(provider, key)
     print(f'[{provider} · {model}]', flush=True)

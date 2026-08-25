@@ -23,7 +23,29 @@ DESIGN RULES, all deliberate:
 import json, os, subprocess, sys, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from keystore import load_key, configured, KNOWN
+from keystore import load_key, configured, KNOWN, CONFIG_DIR
+
+
+def load_dest():
+    try:
+        return json.load(open(os.path.join(CONFIG_DIR, 'prefs.json'))).get('dest')
+    except Exception:
+        return None
+
+
+def save_dest(d):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        p = os.path.join(CONFIG_DIR, 'prefs.json')
+        cur = {}
+        try:
+            cur = json.load(open(p))
+        except Exception:
+            pass
+        cur['dest'] = d
+        json.dump(cur, open(p, 'w'), indent=2)
+    except Exception:
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -100,7 +122,10 @@ def build_context():
     """Everything the model needs, assembled from the project itself so it stays
     current: the operating notes, the CLI surface, and which providers exist."""
     parts = []
-    for name in ('CLAUDE.md', 'README.md'):
+    # KNOWLEDGE.md is the whole point: without it the model knows the flags but none of
+    # the reasons, and will happily ask for 10-bit on a title where that costs 8x the
+    # bitrate, or trust a "1080p" label that is really a 1 GB upscale.
+    for name in ('KNOWLEDGE.md', 'README.md'):
         p = os.path.join(PROJECT, name)
         if os.path.exists(p):
             parts.append(f'--- {name} ---\n' + open(p).read()[:14000])
@@ -110,6 +135,39 @@ def build_context():
         parts.append('--- media CLI ---\n' + h)
     except Exception:
         pass
+    # Where things can actually go. Without this the model asks "where should I put it?"
+    # with no idea what exists, and the user has to type an absolute path from memory.
+    dests, last = [], load_dest()
+    for base in ('/Volumes', os.path.expanduser('~/Movies'), os.path.expanduser('~/Media')):
+        if not os.path.isdir(base):
+            continue
+        if base == '/Volumes':
+            # The boot volume and Time Machine snapshots are not download targets; the
+            # first fills your system disk, the second is not writable in any useful way.
+            SKIP = ('macintosh hd', 'com.apple.timemachine', 'recovery', 'preboot', 'vm')
+            for v in sorted(os.listdir(base)):
+                p_ = os.path.join(base, v)
+                if v.startswith('.') or not os.path.isdir(p_):
+                    continue
+                if any(k in v.lower() for k in SKIP) or not os.access(p_, os.W_OK):
+                    continue
+                try:
+                    st = os.statvfs(p_)
+                    free = st.f_bavail * st.f_frsize / 1e9
+                except Exception:
+                    continue
+                subs = [d for d in sorted(os.listdir(p_))[:40]
+                        if os.path.isdir(os.path.join(p_, d)) and not d.startswith('.')
+                        and d.lower() in ('shows', 'tv', 'movies', 'media', 'series')]
+                for sub in (subs or ['']):
+                    d_ = os.path.join(p_, sub).rstrip('/')
+                    dests.append(f"{d_}  ({free:.0f} GB free)")
+        else:
+            dests.append(base)
+    parts.append('--- destinations available on this machine ---\n' +
+                 ('\n'.join(dests) if dests else 'none detected — ask the user for a path') +
+                 (f'\nLAST USED (prefer this unless told otherwise): {last}' if last else ''))
+
     cfg = configured()
     parts.append('--- available services (booleans only; you are NOT given keys) ---\n' +
                  '\n'.join(f'{k}: {"configured" if v else "not configured"}'
@@ -126,7 +184,12 @@ SYSTEM = """You help a user drive a media-library CLI. You are given the project
 operating notes and the CLI surface.
 
 Ask SHORT clarifying questions one at a time until you know: what title, movie or
-series, which seasons/episodes, the destination folder, and the quality tier. Prefer
+series, which seasons/episodes, the destination folder, and the quality tier.
+
+You are given the destinations that exist on this machine with their free space. SUGGEST
+one rather than asking the user to type a path from memory — e.g. "I'll put it in
+/Volumes/Media/Shows (1.2 TB free), or tell me somewhere else." If a LAST USED path is
+given, default to it. Warn if free space looks tight for what was asked. Prefer
 sensible defaults over interrogating the user — only ask what you genuinely cannot
 infer.
 
@@ -235,6 +298,8 @@ def main():
                 print('  --dry-run: not executed'); return
             if input('\nrun this? [y/N] ').strip().lower() not in ('y', 'yes'):
                 print('cancelled'); return
+            if '--dest' in args:
+                save_dest(args[args.index('--dest') + 1])
             sys.exit(subprocess.run(full).returncode)
         print(reply.strip()[:600]); return
     print('gave up after 12 turns')

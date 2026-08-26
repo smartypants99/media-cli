@@ -592,8 +592,32 @@ def grab(imdb, dest, name, res, season=None, episode=None,
     return False
 
 
+def _library_root():
+    try:
+        import json as _j
+        return _j.load(open(os.path.expanduser(
+            '~/.config/media/prefs.json'))).get('library')
+    except Exception:
+        return None
+
+
 def main():
     a = sys.argv[1:]
+    # Guard the arguments HERE, so every caller is covered — the AI front end, opencode,
+    # a script, or a person typing. When these checks lived only in the AI layer,
+    # anything else driving the CLI bypassed them, which is backwards.
+    if a and not a[0].startswith('-'):
+        try:
+            from argguard import guard
+            fixed, note, err = guard(a, library=_library_root())
+            if err:
+                print(f'  {err}', file=sys.stderr); sys.exit(2)
+            if note:
+                print(f'  {note}', flush=True)
+            a = fixed
+            sys.argv = [sys.argv[0]] + a
+        except ImportError:
+            pass
     if not a:
         print('usage: fetch.py <imdb> [--movie --name NAME | --season N --eps 25-27] '
               '--dest DIR [--res 1080p]'); sys.exit(2)

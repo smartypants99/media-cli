@@ -457,65 +457,14 @@ def parse_action(txt):
         return None
 
 
-# flags that consume exactly one value
-TAKES_VALUE = {'--name', '--season', '--eps', '--dest', '--res', '--quality',
-               '--depth', '--audio', '--release', '--minmin', '--maxmin',
-               '--samples', '--workers'}
+from argguard import guard as _guard, TAKES_VALUE
 
 
 def fix_paths(args):
-    """Repair a --dest the model split across arguments, and map a drive name the user
-    said to the volume that actually exists.
-
-    Observed: for "into my hard drive TD in the folder kjbkhb" an 8B emitted
-    ["--dest", "/Volumes/TD/", "kjbkhb"] — two arguments. That passes a naive flag check
-    and silently downloads to the wrong directory. It also said TD when the mounted
-    volume is TD-storage.
-    """
-    if '--dest' not in args:
-        return args, None
-    i = args.index('--dest')
-    j = i + 1
-    parts = []
-    while j < len(args) and not args[j].startswith('--'):
-        parts.append(args[j]); j += 1
-    if not parts:
-        return args, 'no value for --dest'
-    dest = parts[0] if len(parts) == 1 else os.path.join(*[parts[0].rstrip('/')] + parts[1:])
-    note = None
-    dest = os.path.expanduser(dest)
-    # A RELATIVE dest silently creates a folder in the working directory instead of on
-    # the drive. Observed: a model emitted "TD-storage/kjbkhb" with no leading /Volumes.
-    # Anchor it: under the library root if it looks like a bare folder, otherwise /Volumes.
-    if not dest.startswith('/'):
-        lib = prefs().get('library')
-        head = dest.split('/')[0]
-        try:
-            vols = [v for v in os.listdir('/Volumes') if not v.startswith('.')]
-        except Exception:
-            vols = []
-        if head in vols or any(v.lower().startswith(head.lower()) for v in vols):
-            dest = '/Volumes/' + dest
-            note = f'relative path anchored to /Volumes: {dest}'
-        elif lib:
-            dest = os.path.join(lib, dest)
-            note = f'relative path anchored to library root: {dest}'
-        else:
-            return args, f'--dest must be an absolute path, got {dest!r}'
-    # map a said-name to a real volume: "TD" -> "TD-storage"
-    if dest.startswith('/Volumes/') and not os.path.isdir(os.path.dirname(dest.rstrip('/')) or '/'):
-        want = dest.split('/')[2] if len(dest.split('/')) > 2 else ''
-        try:
-            vols = [v for v in os.listdir('/Volumes') if not v.startswith('.')]
-        except Exception:
-            vols = []
-        if want and want not in vols:
-            m = [v for v in vols if v.lower().startswith(want.lower())
-                 or want.lower() in v.lower()]
-            if len(m) == 1:
-                dest = dest.replace(f'/Volumes/{want}', f'/Volumes/{m[0]}', 1)
-                note = f'drive {want!r} -> {m[0]!r}'
-    return args[:i] + ['--dest', dest] + args[j:], note
+    """Thin wrapper over the shared guard so there is ONE implementation. fetch.py runs
+    the same checks itself, so this is belt-and-braces for the built-in backend."""
+    fixed, note, err = _guard(args, library=prefs().get('library'))
+    return fixed, (note or err)
 
 
 def validate(cmd, args):

@@ -102,8 +102,20 @@ like-for-like.
 
 Describe what you want; it asks what it needs and runs the right command.
 
-Providers: **Ollama Cloud** and **NVIDIA**. Whichever key is configured is used, and the
-best available model is picked automatically.
+Two backends:
+
+- **opencode** (default when installed and no API key is set) — ships free models needing
+  no key at all, and has real file/shell tools, so it can answer "what folders are on my
+  drive?" as well as run downloads. Its own approval prompts govern what executes.
+- **built-in** (Ollama Cloud / NVIDIA) — used when a key is configured. Faster and
+  guarded by a strict command whitelist, but it can only run `media` subcommands.
+
+`--backend opencode|api` forces one. Measured on the same request: NVIDIA gpt-oss-120b
+2.6s, opencode mimo-v2.5-free 18s (both correct); a third free model produced a relative
+path that would have written to the working directory instead of the drive.
+
+Prefer MoE models — large total parameters with a small active set gives capability at
+near-small-model latency. Dense 70B models took 41-54s for the same work.
 
 Four rules, all deliberate:
 

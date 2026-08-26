@@ -160,6 +160,45 @@ def http_json(url, payload=None, key=None, timeout=180):
         return json.loads(r.read().decode())
 
 
+def have_opencode():
+    from shutil import which
+    return which('opencode') is not None
+
+
+def run_via_opencode(request, model=None):
+    """Delegate to opencode: free models, real tools, its own permission prompts.
+
+    The whitelist backend cannot answer "what folders are on my drive?" — by design, it
+    only runs media subcommands. opencode brings a working agent loop with file and shell
+    tools, and ships free models needing no API key at all, so it handles both the
+    conversation and the wider questions. Its own approval prompts govern what runs.
+    """
+    ctx_path = os.path.join(PROJECT, 'KNOWLEDGE.md')
+    lib = prefs().get('library') or '(not set)'
+    cfg = configured()
+    deb = [k for k in ('premiumize', 'alldebrid', 'realdebrid', 'torbox') if cfg.get(k)]
+    media_bin = os.path.join(HERE, 'media')
+    brief = f"""You manage a media library using the `media` CLI at {media_bin}.
+
+Library root: {lib}. Put shows in subfolders under it.
+Debrid configured: {', '.join(deb) if deb else 'none (downloads will be slower)'}
+
+Run `{media_bin}` with no arguments to see every command and flag.
+Quality tiers: best | balanced | small (default balanced).
+Pass the IMDb id to `media fetch`; look it up if you need to.
+Operating notes with the measured reasoning: {ctx_path}
+
+Use your tools to answer questions about the drives directly.
+Confirm with the user before downloading anything.
+
+The user says: {request}"""
+    cmd = ['opencode', 'run']
+    if model:
+        cmd += ['-m', model]
+    cmd.append(brief)
+    return subprocess.run(cmd).returncode
+
+
 def pick_provider(explicit=None):
     have = {p: load_key(p) for p in PROVIDERS if load_key(p)}
     if explicit:
@@ -413,6 +452,25 @@ def fix_paths(args):
         return args, 'no value for --dest'
     dest = parts[0] if len(parts) == 1 else os.path.join(*[parts[0].rstrip('/')] + parts[1:])
     note = None
+    dest = os.path.expanduser(dest)
+    # A RELATIVE dest silently creates a folder in the working directory instead of on
+    # the drive. Observed: a model emitted "TD-storage/kjbkhb" with no leading /Volumes.
+    # Anchor it: under the library root if it looks like a bare folder, otherwise /Volumes.
+    if not dest.startswith('/'):
+        lib = prefs().get('library')
+        head = dest.split('/')[0]
+        try:
+            vols = [v for v in os.listdir('/Volumes') if not v.startswith('.')]
+        except Exception:
+            vols = []
+        if head in vols or any(v.lower().startswith(head.lower()) for v in vols):
+            dest = '/Volumes/' + dest
+            note = f'relative path anchored to /Volumes: {dest}'
+        elif lib:
+            dest = os.path.join(lib, dest)
+            note = f'relative path anchored to library root: {dest}'
+        else:
+            return args, f'--dest must be an absolute path, got {dest!r}'
     # map a said-name to a real volume: "TD" -> "TD-storage"
     if dest.startswith('/Volumes/') and not os.path.isdir(os.path.dirname(dest.rstrip('/')) or '/'):
         want = dest.split('/')[2] if len(dest.split('/')) > 2 else ''
@@ -474,11 +532,31 @@ def main():
         i = argv.index('--model'); model_arg = argv[i + 1]; del argv[i:i + 2]
     dry = '--dry-run' in argv
     argv = [a for a in argv if a != '--dry-run']
+    backend = None
+    if '--backend' in argv:
+        i = argv.index('--backend'); backend = argv[i + 1]; del argv[i:i + 2]
     if '--set-library' in argv:
         i = argv.index('--set-library')
         set_pref('library', os.path.expanduser(argv[i + 1]))
         print(f'library root set to {prefs()["library"]}'); return
     ensure_library()
+    # opencode is preferred when present: free models, real tools, no key needed. The
+    # built-in backend stays for machines without it.
+    if backend != 'api' and (backend == 'opencode' or
+                             (have_opencode() and not load_key('nvidia')
+                              and not load_key('ollama'))):
+        if not have_opencode():
+            sys.exit('opencode not installed — see https://opencode.ai')
+        req = ' '.join(argv).strip()
+        if not req:
+            try:
+                print("  (opencode backend — say what you want)\n")
+                req = input('> ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print(); return
+        if not req:
+            return
+        sys.exit(run_via_opencode(req, model_arg))
     provider, key = pick_provider(provider_arg)
     model = pick_model(provider, key, model_arg)
     print(f'[{provider} · {model}]', flush=True)

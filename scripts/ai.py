@@ -192,11 +192,32 @@ Use your tools to answer questions about the drives directly.
 Confirm with the user before downloading anything.
 
 The user says: {request}"""
-    cmd = ['opencode', 'run']
-    if model:
-        cmd += ['-m', model]
+    # Best of both: opencode's tools and agent loop, driven by a fast MoE model on the
+    # user's own NVIDIA/Ollama key. The key is injected into the environment here from
+    # the keystore, so it is never written into opencode's config — one copy on disk.
+    env = dict(os.environ)
+    chosen = model
+    for name, var, default in (('nvidia', 'NVIDIA_API_KEY', 'nvidia/openai/gpt-oss-120b'),
+                               ('ollama', 'OLLAMA_API_KEY', None)):
+        k = load_key(name)
+        if k:
+            env[var] = k
+            if not chosen and default:
+                chosen = default
+    # opencode refuses to touch anything outside its working directory, so point it at
+    # the VOLUME holding the library. Without this it silently blocks on an
+    # external_directory permission request and looks like a hang.
+    workdir = lib if lib and os.path.isdir(lib) else PROJECT
+    if workdir.startswith('/Volumes/'):
+        parts = workdir.split('/')
+        if len(parts) > 2:
+            workdir = '/'.join(parts[:3])          # /Volumes/<drive>
+    cmd = ['opencode', 'run', '--dir', workdir]
+    if chosen:
+        cmd += ['-m', chosen]
     cmd.append(brief)
-    return subprocess.run(cmd).returncode
+    print(f"  [opencode · {chosen or 'default model'} · {workdir}]", flush=True)
+    return subprocess.run(cmd, env=env).returncode
 
 
 def pick_provider(explicit=None):
@@ -542,9 +563,7 @@ def main():
     ensure_library()
     # opencode is preferred when present: free models, real tools, no key needed. The
     # built-in backend stays for machines without it.
-    if backend != 'api' and (backend == 'opencode' or
-                             (have_opencode() and not load_key('nvidia')
-                              and not load_key('ollama'))):
+    if backend != 'api' and (backend == 'opencode' or have_opencode()):
         if not have_opencode():
             sys.exit('opencode not installed — see https://opencode.ai')
         req = ' '.join(argv).strip()

@@ -178,8 +178,18 @@ def run_via_opencode(request, model=None):
     cfg = configured()
     deb = [k for k in ('premiumize', 'alldebrid', 'realdebrid', 'torbox') if cfg.get(k)]
     media_bin = os.path.join(HERE, 'media')
+    _wd = lib if lib and os.path.isdir(lib) else PROJECT
+    if _wd.startswith('/Volumes/'):
+        _p = _wd.split('/')
+        if len(_p) > 2:
+            _wd = '/'.join(_p[:3])
     brief = f"""You manage a media library using the `media` CLI at {media_bin}.
 
+YOUR WORKING DIRECTORY IS THE DRIVE ITSELF. Use plain relative paths ("ls -1 .") or the
+plain absolute path. NEVER build a path through $HOME/.. or any parent traversal — that
+resolves outside the working directory and is auto-rejected, which looks like a hang.
+
+Working directory (already open, use it directly): {_wd}
 Library root: {lib}. Put shows in subfolders under it.
 Debrid configured: {', '.join(deb) if deb else 'none (downloads will be slower)'}
 
